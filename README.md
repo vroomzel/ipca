@@ -18,12 +18,13 @@ as well as a series of dependent variables, `y`, of the same length as `X`.
 ```python
 import numpy as np
 from statsmodels.datasets import grunfeld
+
 data = grunfeld.load_pandas().data
 data.year = data.year.astype(np.int64)
 
 # Establish unique IDs to conform with package
 N = len(np.unique(data.firm))
-ID = dict(zip(np.unique(data.firm).tolist(),np.arange(1,N+1)))
+ID = dict(zip(np.unique(data.firm).tolist(), np.arange(1, N + 1)))
 data.firm = data.firm.apply(lambda x: ID[x])
 
 # use multi-index for panel groups
@@ -33,6 +34,7 @@ X = data.drop('invest', axis=1)
 
 # Call ipca
 from ipca import InstrumentedPCA
+
 regr = InstrumentedPCA(n_factors=1, intercept=False)
 regr = regr.fit(X=X, y=y)
 Gamma, Factors = regr.get_factors(label_ind=True)

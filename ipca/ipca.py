@@ -1,15 +1,15 @@
-from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.model_selection import GroupKFold
-from sklearn.linear_model import ElasticNet
-from sklearn.metrics import r2_score
+import warnings
+
+import numpy as np
+import pandas as pd
+import progressbar
 from joblib import Parallel, delayed
 from numba import jit
-import pandas as pd
-import numpy as np
-import scipy as sp
-import progressbar
-import warnings
-import time
+from sklearn.base import BaseEstimator
+from sklearn.linear_model import ElasticNet
+from sklearn.metrics import r2_score
+from sklearn.model_selection import GroupKFold
+
 
 class InstrumentedPCA(BaseEstimator):
     """
@@ -77,7 +77,9 @@ class InstrumentedPCA(BaseEstimator):
 
 
     def fit(self, X, y, indices=None, PSF=None, Gamma=None,
-            Factors=None, data_type="portfolio", label_ind=False, **kwargs):
+            Factors=None, data_type="panel", sample_weights=None,
+            normalization_choice='PCA_positivemean', normalization_choice_fixed_chars=None,
+            **kwargs):
         """
         Fits the regressor to the data using an alternating least squares
         scheme.
@@ -165,9 +167,12 @@ class InstrumentedPCA(BaseEstimator):
             top of the pre-specified ones.
         """
 
+        assert normalization_choice in ('PCA_positivemean', 'Identity')
+        self.normalization_choice = normalization_choice
         # handle input
-        X, y, indices, metad = _prep_input(X, y, indices)
+        X, y, indices, metad, sample_weights = _prep_input(X, y, indices, sample_weights)
         N, L, T = metad["N"], metad["L"], metad["T"]
+
 
         # set data_type to panel if doing regularized estimation
         if self.alpha > 0.:
@@ -205,6 +210,12 @@ class InstrumentedPCA(BaseEstimator):
             raise ValueError("""The number of factors requested exceeds number
                               of features""")
 
+        # check that we have enough pinned characteristics <-> factors mappings specified
+        if self.normalization_choice == 'Identity':
+            assert len(normalization_choice_fixed_chars) == self.n_factors
+            # convert characteristic names to indices
+            self.normalization_choice_idx = pd.Series(range(len(metad['chars'])), index=metad['chars']).loc[normalization_choice_fixed_chars].values
+
         # Determine fit case - if intercept or PSF or both use PSFcase fitting
         # Note PSFcase in contrast to has_PSF is only indicating
         # that the IPCA fitting is carried out as if PSF were passed even if
@@ -212,7 +223,7 @@ class InstrumentedPCA(BaseEstimator):
         self.PSFcase = True if self.has_PSF or self.intercept else False
 
         # store data
-        self.X, self.y, self.indices, self.PSF = X, y, indices, PSF
+        self.X, self.y, self.indices, self.PSF, self.sample_weights = X, y, indices, PSF, sample_weights
         Q, W, val_obs = _build_portfolio(X, y, indices, metad)
         self.Q, self.W, self.val_obs = Q, W, val_obs
         self.metad = metad
@@ -221,7 +232,7 @@ class InstrumentedPCA(BaseEstimator):
         Gamma, Factors = self._fit_ipca(X=X, y=y, indices=indices, Q=Q,
                                         W=W, val_obs=val_obs, PSF=PSF,
                                         Gamma=Gamma, Factors=Factors,
-                                        data_type=data_type, **kwargs)
+                                        data_type=data_type, sample_weights=sample_weights, **kwargs)
 
         # Store estimates
         if self.PSFcase:
@@ -261,12 +272,12 @@ class InstrumentedPCA(BaseEstimator):
             Gamma = pd.DataFrame(Gamma, index=self.metad["chars"])
             Factors = pd.DataFrame(Factors, columns=self.metad["dates"])
 
-        return Gamma, Factors
+        return Gamma, Factors.T
 
 
     def fit_path(self, X, y, indices=None, PSF=None, alpha_l=None,
                  n_splits=10, split_method=GroupKFold, n_jobs=1,
-                 backend="loky", **kwargs):
+                 backend="loky", sample_weights=None, **kwargs):
         """Fit a path of elastic net fits for various regularizing constants
 
         Parameters
@@ -314,7 +325,7 @@ class InstrumentedPCA(BaseEstimator):
         """
 
         # handle input
-        X, y, indices, metad = _prep_input(X, y, indices)
+        X, y, indices, metad, sample_weights = _prep_input(X, y, indices, sample_weights)
 
         # handle data type, since we are doing regularized estimation
         # only the panel fit makes sense here
@@ -351,7 +362,7 @@ class InstrumentedPCA(BaseEstimator):
 
 
     def predict(self, X=None, indices=None, W=None, mean_factor=False,
-                data_type="panel", label_ind=False):
+                data_type="panel", label_ind=False, factor_ewma_halflife: int = None):
         """wrapper around different data type predict methods
 
         Parameters
@@ -430,15 +441,15 @@ class InstrumentedPCA(BaseEstimator):
             if X is None:
                 X, indices, metad = self.X, self.indices, self.metad
             else:
-                X, y, indices, metad = _prep_input(X, None, indices)
+                X, y, indices, metad, sample_weights = _prep_input(X, None, indices)
             N, L, T = metad["N"], metad["L"], metad["T"]
 
-            pred = self.predict_panel(X, indices, T, mean_factor)
+            pred = self.predict_panel(X, indices, T, mean_factor, factor_ewma_halflife)
 
             if label_ind:
-                pred = pd.DataFrame(pred, columns=["yhat"])
-                ind = pd.DataFrame(indices, columns=["ids", "dates"])
-                pred = pd.concat([ind, pred]).set_index(["ids", "dates"])
+                pred = pd.DataFrame(pred, columns=["yhat"], index=metad['raw_index'])
+                # ind = pd.DataFrame(indices, columns=["ids", "dates"])
+                # pred = pd.concat([ind, pred]).set_index(["ids", "dates"])
 
         elif data_type == "portfolio":
 
@@ -446,7 +457,7 @@ class InstrumentedPCA(BaseEstimator):
                 L = W.shape[0]
                 T = W.shape[2]
             elif X is not None:
-                X, y, indices, metad = _prep_input(X, None, indices)
+                X, y, indices, metad, sample_weights = _prep_input(X, None, indices)
                 Q, W, val_obs = _build_portfolio(X, None, indices, metad)
                 L = W.shape[0]
                 T = W.shape[2]
@@ -470,8 +481,7 @@ class InstrumentedPCA(BaseEstimator):
 
         return pred
 
-
-    def predict_panel(self, X, indices, T, mean_factor=False):
+    def predict_panel(self, X, indices, T, mean_factor=False, factor_ewma_halflife: int = None):
         """
         Predicts fitted values for a previously fitted regressor + panel data
 
@@ -507,20 +517,23 @@ class InstrumentedPCA(BaseEstimator):
             A nan will be returned if there is missing chars information.
         """
 
-        mean_Factors = np.mean(self.Factors, axis=1).reshape((-1, 1))
-
         if mean_factor:
-            ypred = np.squeeze(X.dot(self.Gamma)\
-                .dot(mean_Factors))
+            mean_Factors = np.mean(self.Factors, axis=1).reshape((-1, 1))
+            ypred = np.squeeze(X.dot(self.Gamma).dot(mean_Factors))
         elif T != self.Factors.shape[1]:
-            raise ValueError("If mean_factor isn't used date shape must align\
-                              with Factors shape")
+            raise ValueError("If mean_factor isn't used date shape must align with Factors shape")
         else:
+            if factor_ewma_halflife is None:
+                _factors = self.Factors
+            else:
+                # exponentially weighted moving average of factor realizations from a day before (very first day is a cheat)
+                ewma_Factors = pd.DataFrame(self.Factors).T.ewm(halflife=factor_ewma_halflife).mean().shift(1).bfill().T.values
+                _factors = ewma_Factors
+                
             ypred = np.full((X.shape[0]), np.nan)
             for t in range(T):
                 ix = (indices[:, 1] == t)
-                ypred[ix] = np.squeeze(X[ix, :].dot(self.Gamma)\
-                    .dot(self.Factors[:, t]))
+                ypred[ix] = np.squeeze(X[ix, :].dot(self.Gamma).dot(_factors[:, t]))
         return ypred
 
 
@@ -575,7 +588,7 @@ class InstrumentedPCA(BaseEstimator):
 
 
     def score(self, X, y=None, indices=None, mean_factor=False,
-              data_type="panel"):
+              data_type="panel", sample_weights=None, factor_ewma_halflife: int = None):
         """generate R^2
 
         Parameters
@@ -641,26 +654,26 @@ class InstrumentedPCA(BaseEstimator):
 
         if data_type == "panel":
 
-            X, y, indices, metad = _prep_input(X, y, indices)
+            X, y, indices, metad, sample_weights = _prep_input(X, y, indices, sample_weights)
             if y is None:
                 y = self.y
 
             yhat = self.predict(X=X, indices=indices,
                                 mean_factor=mean_factor,
-                                data_type="panel")
+                                data_type="panel", factor_ewma_halflife=factor_ewma_halflife)
 
-            return r2_score(y, yhat)
+            return r2_score(y, yhat, sample_weight=sample_weights)
 
         elif data_type == "portfolio":
 
-            X, y, indices, metad = _prep_input(X, y, indices)
+            X, y, indices, metad, sample_weights = _prep_input(X, y, indices, sample_weights)
             if y is None:
                 y = self.y
             Q, W, val_obs = _build_portfolio(X, y, indices, metad)
 
             Qhat = self.predict(W=W, mean_factor=mean_factor,
                                 data_type="portfolio")
-            return r2_score(Q, Qhat)
+            return r2_score(Q, Qhat, sample_weight=sample_weights)  # tk: sample_weights here should be different
 
         else:
             return ValueError("Unsupported data_type: %s" % data_type)
@@ -890,12 +903,12 @@ class InstrumentedPCA(BaseEstimator):
         -------
 
         ypred : numpy array
-            The length of the returned array matches the
+            The length of the returned array matches
             the length of data. A nan will be returned if there is missing
             characteristics information.
         """
 
-        X, y, indices, metad = _prep_input(X, y, indices)
+        X, y, indices, metad, sample_weights = _prep_input(X, y, indices)
         N, L, T = metad["N"], metad["L"], metad["T"]
         ypred = np.full((N), np.nan)
 
@@ -915,7 +928,7 @@ class InstrumentedPCA(BaseEstimator):
 
     def _fit_ipca(self, X=None, y=None, indices=None, PSF=None, Q=None,
                   W=None, val_obs=None, Gamma=None, Factors=None, quiet=False,
-                  data_type="portfolio", **kwargs):
+                  data_type="panel", sample_weights=None, **kwargs):
         """
         Fits the regressor to the data using alternating least squares
 
@@ -985,7 +998,7 @@ class InstrumentedPCA(BaseEstimator):
         """
 
         if data_type == "panel":
-            ALS_inputs = (X, y, indices)
+            ALS_inputs = (X, y, indices, sample_weights)
             ALS_fit = self._ALS_fit_panel
         elif data_type == "portfolio":
             ALS_inputs = (Q, W, val_obs)
@@ -1031,6 +1044,8 @@ class InstrumentedPCA(BaseEstimator):
 
         if not quiet:
             print('-- Convergence Reached --')
+
+        self.iter_completed = iter
 
         return Gamma_New, Factor_New
 
@@ -1079,7 +1094,7 @@ class InstrumentedPCA(BaseEstimator):
             # observed factors+latent factors case
             else:
                 if self.n_jobs > 1:
-                    F_New = Parallel(n_jobs=n_jobs, backend=backend)(
+                    F_New = Parallel(n_jobs=self.n_jobs, backend=self.backend)(
                                 delayed(_Ft_fit_PSF_portfolio)(
                                     Gamma_Old, W[:,:,t], Q[:,t], PSF[:,t],
                                     K, Ktilde)
@@ -1128,8 +1143,7 @@ class InstrumentedPCA(BaseEstimator):
 
         return Gamma_New, F_New
 
-
-    def _ALS_fit_panel(self, Gamma_Old, X, y, indices, PSF=None, **kwargs):
+    def _ALS_fit_panel(self, Gamma_Old, X, y, indices, sample_weights=None, PSF=None, **kwargs):
         """Alternating least squares procedure to fit params
 
         Runs using panel data as input
@@ -1142,6 +1156,8 @@ class InstrumentedPCA(BaseEstimator):
         """
 
         T, dates = self.metad["T"], self.metad["dates"]
+        if sample_weights is None:
+            sample_weights = np.ones(y.shape)
 
         if PSF is None:
             L, K = np.shape(Gamma_Old)
@@ -1163,7 +1179,7 @@ class InstrumentedPCA(BaseEstimator):
                     F_New = Parallel(n_jobs=self.n_jobs,
                                     backend=self.backend)(
                                 delayed(_Ft_fit_panel)(
-                                    Gamma_Old, X[tind,:], y[tind])
+                                    Gamma_Old, X[tind, :], y[tind], sample_weights[tind])
                                 for t, tind in enumerate(Tind))
                     F_New = np.stack(F_New, axis=1)
 
@@ -1171,15 +1187,15 @@ class InstrumentedPCA(BaseEstimator):
                     F_New = np.full((K, T), np.nan)
                     for t, tind in enumerate(Tind):
                         F_New[:,t] = _Ft_fit_panel(Gamma_Old, X[tind,:],
-                                                   y[tind])
+                                                   y[tind], sample_weights[tind])
 
             # observed factors+latent factors case
             else:
                 if self.n_jobs > 1:
-                    F_New = Parallel(n_jobs=n_jobs, backend=backend)(
+                    F_New = Parallel(n_jobs=self.n_jobs, backend=self.backend)(
                                 delayed(_Ft_fit_PSF_panel)(
                                     Gamma_Old, X[tind,:], y[tind],
-                                    PSF[:,t], K, Ktilde)
+                                    PSF[:, t], K, Ktilde, sample_weights[tind])
                                 for t, tind in enumerate(Tind))
                     F_New = np.stack(F_New, axis=1)
 
@@ -1188,44 +1204,55 @@ class InstrumentedPCA(BaseEstimator):
                     for t, tind in enumerate(Tind):
                         F_New[:,t] = _Ft_fit_PSF_panel(Gamma_Old, X[tind,:],
                                                        y[tind], PSF[:,t],
-                                                       K, Ktilde)
+                                                       K, Ktilde, sample_weights[tind])
 
         else:
             F_New = None
 
         # ALS Step 2
         Gamma_New = _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde,
-                                     self.alpha, self.l1_ratio, **kwargs)
+                                     self.alpha, self.l1_ratio, sample_weights, **kwargs)
 
         # condition checks
 
         if K > 0:
-            # Enforce Orthogonality in Gamma_alpha and Gamma_beta
-            R1 = _numba_chol(Gamma_New[:, :K].T.dot(Gamma_New[:, :K])).T
-            R2, _, _ = _numba_svd(R1.dot(F_New).dot(F_New.T).dot(R1.T))
-            Gamma_New[:, :K] = _numba_lstsq(Gamma_New[:, :K].T,
-                                            R1.T)[0].dot(R2)
-            F_New = _numba_solve(R2, R1.dot(F_New))
+            if self.normalization_choice == 'PCA_positivemean':
+                # Enforce Orthogonality in Gamma_alpha and Gamma_beta
+                R1 = _numba_chol(Gamma_New[:, :K].T.dot(Gamma_New[:, :K])).T
+                R2, _, _ = _numba_svd(R1.dot(F_New).dot(F_New.T).dot(R1.T))
+                Gamma_New[:, :K] = _numba_lstsq(Gamma_New[:, :K].T,
+                                                R1.T)[0].dot(R2)
+                F_New = _numba_solve(R2, R1.dot(F_New))
 
-            # Enforce sign convention for Gamma_Beta and F_New
-            sg = np.sign(np.mean(F_New, axis=1)).reshape((-1, 1))
-            sg[sg == 0] = 1
-            Gamma_New[:, :K] = np.multiply(Gamma_New[:, :K], sg.T)
-            F_New = np.multiply(F_New, sg)
-
-            if PSF is not None:
-                Gamma_New[:, K:] = (np.identity(Gamma_New.shape[0]) - Gamma_New[:, :K].dot(Gamma_New[:, :K].T)).dot(Gamma_New[:, K:])
-                F_New += Gamma_New[:, :K].T.dot(Gamma_New[:, K:]).dot(PSF)
-
+                # Enforce sign convention for Gamma_Beta and F_New
                 sg = np.sign(np.mean(F_New, axis=1)).reshape((-1, 1))
                 sg[sg == 0] = 1
                 Gamma_New[:, :K] = np.multiply(Gamma_New[:, :K], sg.T)
                 F_New = np.multiply(F_New, sg)
 
+                if PSF is not None:
+                    # tk: not tested
+                    Gamma_New[:, K:] = (np.identity(Gamma_New.shape[0]) - Gamma_New[:, :K].dot(Gamma_New[:, :K].T)).dot(Gamma_New[:, K:])
+                    F_New += Gamma_New[:, :K].T.dot(Gamma_New[:, K:]).dot(PSF)
+
+                    sg = np.sign(np.mean(F_New, axis=1)).reshape((-1, 1))
+                    sg[sg == 0] = 1
+                    Gamma_New[:, :K] = np.multiply(Gamma_New[:, :K], sg.T)
+                    F_New = np.multiply(F_New, sg)
+
+            elif self.normalization_choice == 'Identity':
+                R = Gamma_New[self.normalization_choice_idx, :K]
+                Gamma_New[:, :K] = _numba_solve(R.T, Gamma_New[:, :K].T).T
+                F_New[:K, :] = R.dot(F_New[:K, :])
+                if PSF is not None:
+                    # tk: not tested
+                    Gamma_New[:, K:] = (np.identity(Gamma_New.shape[0]) - Gamma_New[:, :K].dot(Gamma_New[:, :K].T)).dot(Gamma_New[:, K:])
+                    F_New += Gamma_New[:, :K].T.dot(Gamma_New[:, K:]).dot(PSF)
+
         return Gamma_New, F_New
 
 
-def _prep_input(X, y=None, indices=None):
+def _prep_input(X, y=None, indices=None, sample_weights=None):
     """handle mapping from different inputs type to consistent internal data
 
     Parameters
@@ -1302,6 +1329,9 @@ def _prep_input(X, y=None, indices=None):
         X = X[non_nan_ind]
         if y is not None:
             y = y[non_nan_ind]
+        if sample_weights is not None:
+            sample_weights = sample_weights[non_nan_ind]
+            assert y.shape == sample_weights.shape
 
     # if data-frames passed, break out indices from data
     if isinstance(X, pd.DataFrame) and not isinstance(y, pd.Series):
@@ -1318,6 +1348,8 @@ def _prep_input(X, y=None, indices=None):
         yind = y.index
         X = X.values
         y = y.values
+        if sample_weights is not None:
+            sample_weights = sample_weights.values
         if not np.array_equal(Xind, yind):
             raise ValueError("If indices are provided with both X and y\
                               they be the same")
@@ -1329,6 +1361,7 @@ def _prep_input(X, y=None, indices=None):
         raise ValueError("entity-time indices must be provided either\
                           separately or as a MultiIndex with X/y")
 
+    metad = {"raw_index": indices.copy()}
     # extract numpy array and labels from multiindex
     if isinstance(indices, pd.MultiIndex):
         indices = indices.to_frame().values
@@ -1336,6 +1369,7 @@ def _prep_input(X, y=None, indices=None):
     dates = np.unique(indices[:, 1])
     indices[:,0] = np.unique(indices[:,0], return_inverse=True)[1]
     indices[:,1] = np.unique(indices[:,1], return_inverse=True)[1]
+    indices = indices.astype(int)
 
     # init data dimensions
     T = np.size(dates, axis=0)
@@ -1343,7 +1377,6 @@ def _prep_input(X, y=None, indices=None):
     L = np.size(chars, axis=0)
 
     # prep metadata
-    metad = {}
     metad["dates"] = dates
     metad["ids"] = ids
     metad["chars"] = chars
@@ -1351,7 +1384,7 @@ def _prep_input(X, y=None, indices=None):
     metad["N"] = N
     metad["L"] = L
 
-    return X, y, indices, metad
+    return X, y, indices, metad, sample_weights
 
 
 def _build_portfolio(X, y, indices, metad):
@@ -1458,21 +1491,27 @@ def _Ft_fit_PSF_portfolio(Gamma_Old, W_t, Q_t, PSF_t, K, Ktilde):
     return np.squeeze(_numba_solve(m1, m2.reshape((-1, 1))))
 
 
-def _Ft_fit_panel(Gamma_Old, X_t, y_t):
+def _Ft_fit_panel(Gamma_Old, X_t, y_t, w_t=None):
     """fits F_t using panel data"""
 
     exog_t = X_t.dot(Gamma_Old)
-    Ft = _numba_lstsq(exog_t, y_t)[0]
+    if w_t is None:
+        Ft = _numba_lstsq(exog_t, y_t)[0]
+    else:
+        Ft = _numba_wls(exog_t, y_t, w_t)[0]
 
     return Ft
 
 
-def _Ft_fit_PSF_panel(Gamma_Old, X_t, y_t, PSF_t, K, Ktilde):
+def _Ft_fit_PSF_panel(Gamma_Old, X_t, y_t, PSF_t, K, Ktilde, w_t=None):
     """fits F_t using panel data with PSF"""
 
     exog_t = X_t.dot(Gamma_Old)
     y_t_resid = y_t - exog_t[:,K:Ktilde].dot(PSF_t)
-    Ft = _numba_lstsq(exog_t[:,:K], y_t_resid)[0]
+    if w_t is None:
+        Ft = _numba_lstsq(exog_t[:, :K], y_t_resid)[0]
+    else:
+        Ft = _numba_wls(exog_t[:, :K], y_t_resid, w_t)[0]
 
     return Ft
 
@@ -1524,7 +1563,7 @@ def _Gamma_fit_portfolio(F_New, Q, W, val_obs, PSF, L, K, Ktilde, T):
     return Gamma_New
 
 
-def _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde, alpha, l1_ratio,
+def _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde, alpha, l1_ratio, sample_weights,
                      **kwargs):
     """helper function for estimating vectorized Gamma with panel"""
 
@@ -1544,12 +1583,12 @@ def _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde, alpha, l1_ratio,
     # elastic net fit
     if alpha:
         mod = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, **kwargs)
-        mod.fit(ZkF, y)
+        mod.fit(ZkF, y, sample_weight=sample_weights)
         gamma = mod.coef_
 
     # OLS fit
     else:
-        gamma = _numba_lstsq(ZkF, y)[0]
+        gamma = _numba_wls(ZkF, y, sample_weights)[0]
 
     gamma = gamma.reshape((Ktilde, L)).T
 
@@ -1625,8 +1664,7 @@ def _fit_cv(model, X, y, indices, PSF, n_splits, split_method, alpha,
         params = model.get_params()
         params["alpha"] = alpha
         train_IPCA = InstrumentedPCA(**params)
-        train_IPCA = train_IPCA.fit(train_X, train_y, train_indices,
-                                    train_PSF, **kwargs)
+        train_IPCA = train_IPCA.fit(train_X, train_y, train_indices, train_PSF, **kwargs)
 
         # get MSE
         test_pred = train_IPCA.predict(test_X, test_indices, mean_factor=True)
@@ -1737,6 +1775,16 @@ def _numba_solve(m1, m2):
 @jit(nopython=True)
 def _numba_lstsq(m1, m2):
     return np.linalg.lstsq(np.ascontiguousarray(m1), np.ascontiguousarray(m2))
+
+
+@jit(nopython=True)
+def _numba_wls(m1, m2, weights):
+    n = m2.shape[0]
+    w = np.sqrt(weights / weights.sum())  # normalize to sum up to 1
+    x = np.multiply(m1, np.reshape(w, (n, -1)))
+    y = m2 * w
+    return np.linalg.lstsq(np.ascontiguousarray(x), np.ascontiguousarray(y))
+
 
 @jit(nopython=True)
 def _numba_kron(m1, m2):
